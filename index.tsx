@@ -7,7 +7,7 @@
 import "./style.css";
 
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
-import { definePluginSettings } from "@api/Settings";
+import { definePluginSettings, SettingsStore } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import type { Channel, User } from "@vencord/discord-types";
@@ -155,12 +155,42 @@ export function isRunning() {
     return running;
 }
 
-/** Bumped whenever the ignore list or a setting changes, so memoized filter results are invalidated */
+/** Bumped whenever the ignore list, a setting or your block/ignore list changes, so memoized results are invalidated */
 let version = 0;
 let ignoredIds = new Set<string>();
 
-function rebuildIgnoredIds() {
+// Plain copy of the settings. Reading settings.store goes through Vencord's settings proxy,
+// which is slow for code that runs on every message render and every Flux event.
+let opts = {} as ReturnType<typeof readOptions>;
+
+function readOptions() {
+    const s = settings.store;
+    return {
+        hideMessages: s.hideMessages,
+        blockLiveMessages: s.blockLiveMessages,
+        replyMode: s.replyMode as ReplyMode,
+        anonymizeMentions: s.anonymizeMentions,
+        mentionPlaceholder: `@${s.mentionPlaceholder?.trim() || "Discord User"}`,
+        hideDMs: s.hideDMs,
+        blockRequests: s.blockRequests,
+        hideTyping: s.hideTyping,
+        hideReactions: s.hideReactions,
+        hideInMemberList: s.hideInMemberList,
+        hideInVoice: s.hideInVoice,
+        includeBlocked: s.includeBlocked,
+        includeNativeIgnored: s.includeNativeIgnored
+    };
+}
+
+function syncOptions() {
+    opts = readOptions();
     ignoredIds = new Set(Object.keys(settings.store.users ?? {}));
+    version++;
+}
+
+// With "include blocked/ignored" on, blocking or ignoring someone in Discord changes who is hidden
+function onRelationshipsChange() {
+    if (opts.includeBlocked || opts.includeNativeIgnored) version++;
 }
 
 export function isTrulyIgnored(userId: string) {
@@ -172,7 +202,7 @@ export function isHidden(userId?: string | null): boolean {
     if (!running || !userId) return false;
     if (ignoredIds.has(userId)) return userId !== UserStore.getCurrentUser()?.id;
 
-    const { includeBlocked, includeNativeIgnored } = settings.store;
+    const { includeBlocked, includeNativeIgnored } = opts;
     if (!includeBlocked && !includeNativeIgnored) return false;
 
     return (includeBlocked && RelationshipStore.isBlocked(userId))
@@ -209,15 +239,25 @@ function isReplyToHidden(message: any) {
     return isHidden(getRepliedToAuthorId(message));
 }
 
+// Discord asks about the same message records over and over while rendering. Records are
+// immutable, so the answer only changes when `version` does.
+const messageCache = new WeakMap<object, { v: number; hide: boolean; }>();
+
 /** Whether a message should be treated as ignored (and therefore hidden) */
 export function shouldHideMessage(message: any): boolean {
-    if (!running || message == null) return false;
+    if (!running || message == null || typeof message !== "object") return false;
 
-    const { hideMessages, replyMode } = settings.store;
-    if (hideMessages && isAuthoredByHidden(message)) return true;
-    if (replyMode === "hideMessage" && isReplyToHidden(message)) return true;
+    const cached = messageCache.get(message);
+    if (cached?.v === version) return cached.hide;
 
-    return false;
+    const hide = (opts.hideMessages && isAuthoredByHidden(message))
+        || (opts.replyMode === "hideMessage" && isReplyToHidden(message));
+
+    // A reply's target can finish loading later, so don't cache a "no" that depends on it
+    if (hide || opts.replyMode !== "hideMessage" || message.type !== MESSAGE_TYPE_REPLY)
+        messageCache.set(message, { v: version, hide });
+
+    return hide;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +272,7 @@ function runOutsideDispatch(fn: () => void) {
 }
 
 function refresh() {
-    version++;
-    rebuildIgnoredIds();
+    syncOptions();
     memberListCache.clear();
 
     runOutsideDispatch(() => {
@@ -355,11 +394,25 @@ function getDmRecipientId(channel: any): string | undefined {
     return typeof recipient === "string" ? recipient : recipient?.id;
 }
 
+const INTERCEPTED_EVENTS = new Set([
+    "MESSAGE_CREATE",
+    "MESSAGE_UPDATE",
+    "TYPING_START",
+    "MESSAGE_REACTION_ADD",
+    "MESSAGE_REACTION_REMOVE",
+    "MESSAGE_REACTION_ADD_USERS",
+    "RELATIONSHIP_ADD",
+    "CHANNEL_CREATE"
+]);
+
 function interceptor(event: any): boolean {
     if (!running) return false;
 
+    // Most Flux events are unrelated, so bail out before touching anything else
+    if (!INTERCEPTED_EVENTS.has(event.type)) return false;
+
     try {
-        const s = settings.store;
+        const s = opts;
 
         switch (event.type) {
             case "MESSAGE_CREATE":
@@ -371,7 +424,7 @@ function interceptor(event: any): boolean {
                 return s.blockLiveMessages && isAuthoredByHidden(event.message);
 
             case "TYPING_START":
-                return s.hideTyping && isHidden(event.userId);
+                return opts.hideTyping && isHidden(event.userId);
 
             // Dropping both keeps counts consistent: reactions they add while ignored are never counted
             case "MESSAGE_REACTION_ADD":
@@ -436,16 +489,21 @@ function wrapMethod(store: any, name: string, make: (original: (...args: any[]) 
 // Results are memoized per input so components that compare snapshots by reference don't re-render in a loop
 const memo = new WeakMap<object, { sig: string; out: any; }>();
 
+// Discord's stores hand back the same array until something changes, so the filtered result
+// (including "nothing to hide") is cached per array until it or `version` changes.
+const listMemo = new WeakMap<object, { v: number; length: number; out: any; }>();
+
 function filterList<T>(list: T[], getUserId: (item: T) => string | undefined | null, enabled: boolean): T[] {
     if (!enabled || !running || !Array.isArray(list) || list.length === 0) return list;
-    if (!list.some(item => isHidden(getUserId(item)))) return list;
 
-    const sig = `${version}:${list.length}`;
-    const cached = memo.get(list);
-    if (cached?.sig === sig) return cached.out;
+    const cached = listMemo.get(list);
+    if (cached?.v === version && cached.length === list.length) return cached.out;
 
-    const out = list.filter(item => !isHidden(getUserId(item)));
-    memo.set(list, { sig, out });
+    const out = list.some(item => isHidden(getUserId(item)))
+        ? list.filter(item => !isHidden(getUserId(item)))
+        : list;
+
+    listMemo.set(list, { v: version, length: list.length, out });
     return out;
 }
 
@@ -475,17 +533,21 @@ const dmChannelUserId = (channelId: string) => getDmRecipientId(ChannelStore.get
 const memberListCache = new Map<string, { key: string; out: any; }>();
 
 function filterMemberList(props: any) {
-    if (!running || !settings.store.hideInMemberList || props == null) return props;
+    if (!running || !opts.hideInMemberList || props == null) return props;
 
     const { rows, groups } = props;
     if (!Array.isArray(rows) || !Array.isArray(groups)) return props;
 
-    const isHiddenRow = (row: any) => row?.type === "MEMBER" && isHidden(row.user?.id);
-    if (!rows.some(isHiddenRow)) return props;
-
+    // The list's own version changes whenever a row changes, so check the cache before scanning
     const key = `${props.version}:${version}:${rows.length}`;
     const cached = memberListCache.get(props.listId);
-    if (cached?.key === key) return cached.out;
+    if (cached?.key === key) return cached.out ?? props;
+
+    const isHiddenRow = (row: any) => row?.type === "MEMBER" && isHidden(row.user?.id);
+    if (!rows.some(isHiddenRow)) {
+        memberListCache.set(props.listId, { key, out: null });
+        return props;
+    }
 
     const groupsByIndex = new Map<number, any>();
     for (const group of groups) groupsByIndex.set(group.index, group);
@@ -532,8 +594,6 @@ function filterMemberList(props: any) {
 }
 
 function installStoreWrappers() {
-    const s = settings.store;
-
     const SortedVoiceStateStore = findStore("SortedVoiceStateStore");
     const ChannelRTCStore = findStore("ChannelRTCStore");
     const PrivateChannelSortStore = findStore("PrivateChannelSortStore");
@@ -545,15 +605,15 @@ function installStoreWrappers() {
     wrapMethod(RelationshipStore, "isIgnoredForMessage", original => message => original(message) || shouldHideMessage(message));
 
     // Typing
-    wrapMethod(TypingStore, "getTypingUsers", original => channelId => filterUserRecord(original(channelId), s.hideTyping));
+    wrapMethod(TypingStore, "getTypingUsers", original => channelId => filterUserRecord(original(channelId), opts.hideTyping));
 
     // DM list
-    wrapMethod(PrivateChannelSortStore, "getPrivateChannelIds", original => () => filterList(original(), dmChannelUserId, s.hideDMs));
+    wrapMethod(PrivateChannelSortStore, "getPrivateChannelIds", original => () => filterList(original(), dmChannelUserId, opts.hideDMs));
     wrapMethod(PrivateChannelSortStore, "getSortedChannels", original => () => {
         const sections = original();
         if (!Array.isArray(sections)) return sections;
 
-        const filtered = sections.map((section: any[]) => filterList(section, (e: any) => dmChannelUserId(e?.channelId), s.hideDMs));
+        const filtered = sections.map((section: any[]) => filterList(section, (e: any) => dmChannelUserId(e?.channelId), opts.hideDMs));
         if (filtered.every((section, i) => section === sections[i])) return sections;
 
         const cached = memo.get(sections);
@@ -567,21 +627,21 @@ function installStoreWrappers() {
     // Member list
     wrapMethod(ChannelMemberStore, "getProps", original => (guildId, channelId) => filterMemberList(original(guildId, channelId)));
     wrapMethod(ChannelMemberStore, "getRows", original => (guildId, channelId) => {
-        if (!running || !s.hideInMemberList) return original(guildId, channelId);
+        if (!running || !opts.hideInMemberList) return original(guildId, channelId);
         return ChannelMemberStore.getProps(guildId, channelId).rows;
     });
 
     // Voice
     const rawVoiceStatesForChannel = VoiceStateStore.getVoiceStatesForChannel.bind(VoiceStateStore);
-    wrapMethod(VoiceStateStore, "getVoiceStatesForChannel", original => channelId => filterUserRecord(original(channelId), s.hideInVoice));
-    wrapMethod(VoiceStateStore, "getVideoVoiceStatesForChannel", original => channelId => filterUserRecord(original(channelId), s.hideInVoice));
-    wrapMethod(VoiceStateStore, "getVoiceStates", original => guildId => filterUserRecord(original(guildId), s.hideInVoice));
+    wrapMethod(VoiceStateStore, "getVoiceStatesForChannel", original => channelId => filterUserRecord(original(channelId), opts.hideInVoice));
+    wrapMethod(VoiceStateStore, "getVideoVoiceStatesForChannel", original => channelId => filterUserRecord(original(channelId), opts.hideInVoice));
+    wrapMethod(VoiceStateStore, "getVoiceStates", original => guildId => filterUserRecord(original(guildId), opts.hideInVoice));
 
-    wrapMethod(SortedVoiceStateStore, "getVoiceStatesForChannel", original => channel => filterList(original(channel), sortedVoiceUserId, s.hideInVoice));
-    wrapMethod(SortedVoiceStateStore, "getVoiceStatesForChannelAlt", original => (channelId, guildId) => filterList(original(channelId, guildId), sortedVoiceUserId, s.hideInVoice));
+    wrapMethod(SortedVoiceStateStore, "getVoiceStatesForChannel", original => channel => filterList(original(channel), sortedVoiceUserId, opts.hideInVoice));
+    wrapMethod(SortedVoiceStateStore, "getVoiceStatesForChannelAlt", original => (channelId, guildId) => filterList(original(channelId, guildId), sortedVoiceUserId, opts.hideInVoice));
     wrapMethod(SortedVoiceStateStore, "getVoiceStates", original => guildId => {
         const byChannel = original(guildId);
-        if (!running || !s.hideInVoice || byChannel == null) return byChannel;
+        if (!running || !opts.hideInVoice || byChannel == null) return byChannel;
 
         let changed = false;
         const out: Record<string, any[]> = {};
@@ -600,14 +660,14 @@ function installStoreWrappers() {
     });
     wrapMethod(SortedVoiceStateStore, "countVoiceStatesForChannel", original => channelId => {
         const count = original(channelId);
-        if (!running || !s.hideInVoice) return count;
+        if (!running || !opts.hideInVoice) return count;
 
         const hiddenCount = Object.keys(rawVoiceStatesForChannel(channelId) ?? {}).filter(isHidden).length;
         return Math.max(0, count - hiddenCount);
     });
 
     for (const name of ["getParticipants", "getSpeakingParticipants", "getFilteredParticipants", "getVideoParticipants", "getStreamParticipants"]) {
-        wrapMethod(ChannelRTCStore, name, original => channelId => filterList(original(channelId), participantUserId, s.hideInVoice));
+        wrapMethod(ChannelRTCStore, name, original => channelId => filterList(original(channelId), participantUserId, opts.hideInVoice));
     }
 
     storesToRefresh = [
@@ -719,11 +779,11 @@ export default definePlugin({
     shouldHideMessage,
 
     shouldAnonymizeMention(user?: User | null) {
-        return settings.store.anonymizeMentions && isHidden(user?.id);
+        return running && opts.anonymizeMentions && isHidden(user?.id);
     },
 
     mentionPlaceholder() {
-        return `@${settings.store.mentionPlaceholder?.trim() || "Discord User"}`;
+        return opts.mentionPlaceholder;
     },
 
     shouldHideGroup(props: any): boolean {
@@ -747,7 +807,7 @@ export default definePlugin({
 
     shouldHideReplyPreview(replyMessage: any): boolean {
         try {
-            if (!running || settings.store.replyMode !== "hidePreview") return false;
+            if (!running || opts.replyMode !== "hidePreview") return false;
             return isHidden(replyMessage?.message?.author?.id);
         } catch (e) {
             logger.error("shouldHideReplyPreview failed", e);
@@ -757,7 +817,10 @@ export default definePlugin({
 
     start() {
         running = true;
-        rebuildIgnoredIds();
+        syncOptions();
+        // Catches every option, including the ones without an onChange
+        SettingsStore.addPrefixChangeListener("plugins.TrueIgnore", syncOptions);
+        RelationshipStore.addChangeListener(onRelationshipsChange);
 
         installStoreWrappers();
         addInterceptor();
@@ -770,6 +833,8 @@ export default definePlugin({
 
         removeInterceptor();
         uninstallStoreWrappers();
+        SettingsStore.removePrefixChangeListener("plugins.TrueIgnore", syncOptions);
+        RelationshipStore.removeChangeListener(onRelationshipsChange);
         running = false;
 
         // Recompute Discord's ignored flags without us, so hidden messages come back
