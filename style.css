@@ -1,0 +1,31 @@
+.vc-true-ignore-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--background-base-lower, var(--background-secondary));
+}
+
+.vc-true-ignore-avatar {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--background-mod-normal, var(--background-modifier-accent));
+}
+
+.vc-true-ignore-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.vc-true-ignore-info p {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.vc-true-ignore-muted {
+    color: var(--text-muted);
+}
