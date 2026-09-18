@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { useSettings } from "@api/Settings";
 import { BaseText } from "@components/BaseText";
 import { Button } from "@components/Button";
 import { Flex } from "@components/Flex";
@@ -11,7 +12,8 @@ import { Margins } from "@components/margins";
 import { Paragraph } from "@components/Paragraph";
 import { TextInput, UserStore, UserUtils, useState } from "@webpack/common";
 
-import { addUser, removeUser, settings } from ".";
+import { addUser, isRunning, removeUser, settings } from ".";
+import { isReloadPending, reloadDiscord } from "./reloadPrompt";
 
 const SNOWFLAKE = /^\d{17,20}$/;
 
@@ -40,6 +42,8 @@ function IgnoredUserRow({ id, username, addedAt }: { id: string; username: strin
 
 export function IgnoredUsersList() {
     const { users } = settings.use(["users"]);
+    const enabled = !!useSettings(["plugins.TrueIgnore.enabled"]).plugins.TrueIgnore?.enabled;
+    const reloadPending = isReloadPending(isRunning());
     const [input, setInput] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
@@ -67,6 +71,17 @@ export function IgnoredUsersList() {
 
     return (
         <section>
+            {reloadPending && (
+                <div className={`vc-true-ignore-reload ${Margins.bottom16}`}>
+                    <Paragraph size="sm">
+                        {enabled
+                            ? "TrueIgnore is on, but it won't hide anyone until Discord reloads."
+                            : "TrueIgnore is off, but it keeps hiding people until Discord reloads."}
+                    </Paragraph>
+                    <Button size="small" onClick={reloadDiscord}>Reload now</Button>
+                </div>
+            )}
+
             <BaseText size="md" weight="semibold">Truly ignored users</BaseText>
             <Paragraph size="sm" className={`${Margins.top8} vc-true-ignore-muted`}>
                 Right-click anyone and pick "True Ignore", or paste a user ID below.

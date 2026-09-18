@@ -28,6 +28,7 @@ import {
 } from "@webpack/common";
 
 import { IgnoredUsersList } from "./IgnoredUsersList";
+import { watchForToggle } from "./reloadPrompt";
 
 const logger = new Logger("TrueIgnore");
 
@@ -76,6 +77,18 @@ export const settings = definePluginSettings({
             { label: "Remove the reply preview but keep the reply", value: "hidePreview", default: true },
             { label: "Hide the whole reply (this hides other people's messages too)", value: "hideMessage" }
         ],
+        onChange: () => refresh()
+    },
+    anonymizeMentions: {
+        type: OptionType.BOOLEAN,
+        description: "When someone @mentions them, show a generic name instead of theirs, with no profile popout",
+        default: true,
+        onChange: () => refresh()
+    },
+    mentionPlaceholder: {
+        type: OptionType.STRING,
+        description: "Name to show in place of theirs in @mentions",
+        default: "Discord User",
         onChange: () => refresh()
     },
     hideDMs: {
@@ -137,6 +150,11 @@ export const settings = definePluginSettings({
 // ---------------------------------------------------------------------------
 
 let running = false;
+
+export function isRunning() {
+    return running;
+}
+
 /** Bumped whenever the ignore list or a setting changes, so memoized filter results are invalidated */
 let version = 0;
 let ignoredIds = new Set<string>();
@@ -594,6 +612,8 @@ function installStoreWrappers() {
 
     storesToRefresh = [
         RelationshipStore,
+        // Mention pills read the user from here, so this re-renders them
+        UserStore,
         TypingStore,
         PrivateChannelSortStore,
         ChannelMemberStore,
@@ -675,6 +695,14 @@ export default definePlugin({
             ]
         },
         {
+            // @mentions of them: reuse Discord's pill for unknown users (no popout, no context menu) with a generic name
+            find: ".USER_MENTION)",
+            replacement: {
+                match: /if\(null==(\i)\)return\(0,(\i\.jsx)\)\((\i),\{userId:(\i),className:(\i),children:(\i)\}\)/,
+                replace: "if(null==$1||$self.shouldAnonymizeMention($1))return(0,$2)($3,$self.shouldAnonymizeMention($1)?{userId:null,className:$5,children:$self.mentionPlaceholder()}:{userId:$4,className:$5,children:$6})"
+            }
+        },
+        {
             // Single message previews (pins, inbox, search results): hide instead of "1 ignored message"
             find: "count:1,collapsedReason:",
             replacement: {
@@ -689,6 +717,14 @@ export default definePlugin({
     },
 
     shouldHideMessage,
+
+    shouldAnonymizeMention(user?: User | null) {
+        return settings.store.anonymizeMentions && isHidden(user?.id);
+    },
+
+    mentionPlaceholder() {
+        return `@${settings.store.mentionPlaceholder?.trim() || "Discord User"}`;
+    },
 
     shouldHideGroup(props: any): boolean {
         try {
@@ -740,3 +776,6 @@ export default definePlugin({
         refresh();
     }
 });
+
+// Runs even while the plugin is waiting to start, so turning it on or off prompts for a reload
+watchForToggle(isRunning);

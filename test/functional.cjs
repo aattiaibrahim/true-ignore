@@ -152,6 +152,27 @@ const OK = "222222222222222222";
             r.unmount();
         } catch (e) { check("settings panel renders the ignored user", false, String(e)); }
 
+        // @mentions of them render as a generic, non-clickable pill
+        try {
+            const Mention = Vencord.Webpack.findByCode(".USER_MENTION)");
+            const render = async (userId) => {
+                const el = document.createElement("div"); document.body.appendChild(el);
+                const r = C.createRoot(el);
+                r.render(C.React.createElement(Mention, { userId, parsedUserId: userId, channelId: DM_OK, content: "<@" + userId + ">", className: "" }));
+                await new Promise(res => setTimeout(res, 300));
+                const text = el.textContent; r.unmount(); el.remove();
+                return text;
+            };
+            const ignText = await render(IGN), okText = await render(OK);
+            check("mention of ignored user is generic", ignText === "@Discord User" && okText.includes("ok"), { ignText, okText });
+        } catch (e) { check("mention of ignored user is generic", false, String(e)); }
+
+        // Turning the plugin off asks for a reload
+        Vencord.Settings.plugins.TrueIgnore.enabled = false;
+        await new Promise(res => setTimeout(res, 800));
+        check("reload prompt appears when toggled", document.body.textContent.includes("Reload Discord?"), document.body.textContent.slice(-300));
+        Vencord.Settings.plugins.TrueIgnore.enabled = true;
+
         // Disabling the plugin brings everything back
         Vencord.Plugins.stopPlugin(Vencord.Plugins.plugins.TrueIgnore);
         await tick();
